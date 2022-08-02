@@ -55,7 +55,8 @@ impl Compression {
 
 const DEFAULT_BUFFER_SIZE: usize = 1024 * 1024;
 
-/// Simple program to greet a person
+/// `ddd` - A simple web interface for overwriting a file or writing to a block device
+/// on the server
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
@@ -67,6 +68,8 @@ struct Args {
     #[clap(short = 'l', long = "listen", required(true))]
     listen_on: Vec<SocketAddr>,
 
+    /// Set the buffer size used to write to the block device. Consecutive runs
+    /// of zeroes of this length will be skipped.
     #[clap(long = "buffer-size", default_value_t = DEFAULT_BUFFER_SIZE)]
     buffer_size: usize,
 }
