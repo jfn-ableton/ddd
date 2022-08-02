@@ -53,6 +53,8 @@ impl Compression {
     }
 }
 
+const DEFAULT_BUFFER_SIZE: usize = 1024 * 1024;
+
 /// Simple program to greet a person
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -65,7 +67,7 @@ struct Args {
     #[clap(short = 'l', long = "listen", required(true))]
     listen_on: Vec<SocketAddr>,
 
-    #[clap(long = "buffer-size", default_value_t = 4096)]
+    #[clap(long = "buffer-size", default_value_t = DEFAULT_BUFFER_SIZE)]
     buffer_size: usize,
 }
 
@@ -201,6 +203,16 @@ where
     }
 }
 
+fn to_io_err<E: Into<Box<dyn std::error::Error + Send + Sync>>>(e: E) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, e)
+}
+
+fn mk_io_err<E: Into<Box<dyn std::error::Error + Send + Sync>>>(
+    e: E,
+) -> impl FnOnce() -> io::Error {
+    move || io::Error::new(io::ErrorKind::Other, e)
+}
+
 async fn byte_stream_to_string<B: AsRef<[u8]>, S: Stream<Item = io::Result<B>> + Unpin>(
     mut stream: S,
 ) -> io::Result<String> {
@@ -212,7 +224,7 @@ async fn byte_stream_to_string<B: AsRef<[u8]>, S: Stream<Item = io::Result<B>> +
         out.extend(bytes.as_ref());
     }
 
-    String::from_utf8(out).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+    String::from_utf8(out).map_err(to_io_err)
 }
 
 #[actix_web::main]
@@ -252,70 +264,40 @@ async fn main() -> anyhow::Result<()> {
 
                 let decode_multipart = {
                     multipart
-                        .map(move |val| {
-                            val.map_err(move |e| std::io::Error::new(std::io::ErrorKind::Other, e))
-                        })
+                        .map(move |val| val.map_err(to_io_err))
                         .try_for_each(move |field| {
                             let out = (|| {
                                 match field.name() {
                                     "path" => {
                                         let _ = path_field_tx
                                             .take()
-                                            .ok_or_else(|| {
-                                                std::io::Error::new(
-                                                    std::io::ErrorKind::Other,
-                                                    "Multiple paths specified",
-                                                )
-                                            })?
+                                            .ok_or_else(mk_io_err("Multiple paths specified"))?
                                             .send(
-                                                byte_stream_to_string(field.map_err(|e| {
-                                                    std::io::Error::new(
-                                                        std::io::ErrorKind::Other,
-                                                        e,
-                                                    )
-                                                }))
-                                                .and_then(|bytes| async move {
-                                                    Ok(PathBuf::from(bytes))
-                                                }),
+                                                byte_stream_to_string(field.map_err(to_io_err))
+                                                    .and_then(|bytes| async move {
+                                                        Ok(PathBuf::from(bytes))
+                                                    }),
                                             );
                                     }
                                     "compression" => {
                                         let _ = compression_field_tx
                                             .take()
-                                            .ok_or_else(|| {
-                                                std::io::Error::new(
-                                                    std::io::ErrorKind::Other,
-                                                    "Multiple compression types specified",
-                                                )
-                                            })?
+                                            .ok_or_else(mk_io_err(
+                                                "Multiple compression types specified",
+                                            ))?
                                             .send(
-                                                byte_stream_to_string(field.map_err(|e| {
-                                                    std::io::Error::new(
-                                                        std::io::ErrorKind::Other,
-                                                        e,
-                                                    )
-                                                }))
-                                                .and_then(|value| async move {
-                                                    Compression::from_str(&*value).ok_or_else(
-                                                        || {
-                                                            std::io::Error::new(
-                                                                std::io::ErrorKind::Other,
-                                                                "Unknown compression type",
-                                                            )
-                                                        },
-                                                    )
-                                                }),
+                                                byte_stream_to_string(field.map_err(to_io_err))
+                                                    .and_then(|value| async move {
+                                                        Compression::from_str(&*value).ok_or_else(
+                                                            mk_io_err("Unknown compression type"),
+                                                        )
+                                                    }),
                                             );
                                     }
                                     "body" => {
                                         let _ = body_field_tx
                                             .take()
-                                            .ok_or_else(|| {
-                                                std::io::Error::new(
-                                                    std::io::ErrorKind::Other,
-                                                    "Multiple bodies specified",
-                                                )
-                                            })?
+                                            .ok_or_else(mk_io_err("Multiple bodies specified"))?
                                             .send(field);
                                     }
                                     // TODO: Should we ignore or fail on unknown fields?
@@ -331,21 +313,21 @@ async fn main() -> anyhow::Result<()> {
 
                 let (path, body, compression) = tokio::select!(
                     _ = decode_multipart => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
+                        return Err(io::Error::new(
+                            io::ErrorKind::Other,
                             "No body supplied",
                         ))
                     },
                     (path_body, compression) = join(
                         try_join(
                             path_field_rx
-                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                                .map_err(to_io_err)
                                 .try_flatten(),
                             body_field_rx
-                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
+                                .map_err(to_io_err),
                         ),
                         compression_field_rx
-                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                            .map_err(to_io_err)
                             .try_flatten(),
                     ) => {
                         let (path, body) = path_body?;
@@ -355,7 +337,7 @@ async fn main() -> anyhow::Result<()> {
                 );
                 let compression = compression.unwrap_or(Compression::None);
 
-                let mut body = body.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+                let mut body = body.map_err(to_io_err);
                 let body_reader = ReadStream::new(Pin::new(&mut body));
 
                 let body: Pin<Box<dyn AsyncRead>> = match compression {
@@ -373,10 +355,10 @@ async fn main() -> anyhow::Result<()> {
                 if allowed_paths.is_match(&*path) {
                     write_bytes_to(&*path, body, buffer_size)
                         .await
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                        .map_err(to_io_err)?;
                 }
 
-                Ok::<_, std::io::Error>(format!("Done!"))
+                Ok::<_, io::Error>(format!("Done!"))
             }),
         )
     })
