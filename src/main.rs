@@ -6,10 +6,11 @@ use async_compression::tokio::bufread::{
 };
 use clap::Parser;
 use futures::{
-    future::{join, try_join},
-    Stream, StreamExt, TryFutureExt, TryStreamExt,
+    future::{self, join, try_join, Either},
+    FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
 };
 use std::{
+    iter,
     marker::Unpin,
     net::SocketAddr,
     ops::DerefMut,
@@ -70,35 +71,118 @@ struct Args {
 
     /// Set the buffer size used to write to the block device. Consecutive runs
     /// of zeroes of this length will be skipped.
-    #[clap(long = "buffer-size", default_value_t = DEFAULT_BUFFER_SIZE)]
+    #[clap(short = 'b', long = "buffer-size", default_value_t = DEFAULT_BUFFER_SIZE)]
     buffer_size: usize,
+
+    /// Set the number of buffers to decode in parallel while writing to the output
+    /// file.
+    #[clap(short = 'p', long = "parallel", default_value_t = 1)]
+    parallelism: usize,
 }
 
 async fn write_bytes_to<R: AsyncRead + Unpin>(
     write_to: &Path,
     mut data: R,
     buffer_size: usize,
+    parallelism: usize,
 ) -> anyhow::Result<()> {
+    use tokio::sync::mpsc;
+
+    #[derive(Clone, Debug)]
+    enum Task {
+        Skip(usize),
+        Write(Vec<u8>, usize),
+    }
+
     let mut out = fs::OpenOptions::new().write(true).open(write_to).await?;
-    let mut buffer = vec![0; buffer_size];
+    let (buffer_tx, mut buffer_rx) = mpsc::channel(parallelism);
+    let (task_tx, mut task_rx) = mpsc::channel::<Task>(parallelism);
+
+    let mut opt_task_tx = Some(task_tx);
+
+    let buffer_tx_ref = &buffer_tx;
+    let mut run_tasks = Box::pin(
+        future::try_join_all(
+            iter::repeat(buffer_tx_ref)
+                .take(parallelism)
+                .map(|buffer_tx| buffer_tx.send(vec![0; buffer_size])),
+        )
+        .map_err(anyhow::Error::from)
+        .and_then(move |_| async move {
+            while let Some(task) = task_rx.recv().await {
+                match task {
+                    Task::Skip(num_bytes) => {
+                        out.seek(io::SeekFrom::Current(i64::try_from(num_bytes)?))
+                            .await?;
+                    }
+                    Task::Write(buffer, num_bytes) => {
+                        out.write_all(&buffer[..num_bytes]).await?;
+                        buffer_tx_ref.send(buffer).await?;
+                    }
+                }
+            }
+
+            Ok(out)
+        }),
+    );
 
     loop {
-        let num_bytes = data.read(&mut buffer[..]).await?;
-        if num_bytes == 0 {
-            break;
-        }
+        let read_buffer = Box::pin(
+            buffer_rx
+                .recv()
+                .map(|val| {
+                    val.ok_or_else(|| {
+                        anyhow::format_err!("Programmer error: Buffer list was dropped")
+                    })
+                })
+                .and_then(|mut buffer: Vec<u8>| {
+                    let opt_task_tx = &mut opt_task_tx;
+                    let data = &mut data;
 
-        let chunk = &buffer[..num_bytes];
+                    async move {
+                        let task_tx = if let Some(task_tx) = opt_task_tx.take() {
+                            task_tx
+                        } else {
+                            return Ok(());
+                        };
 
-        if chunk.iter().all(|b| *b == 0) {
-            out.seek(io::SeekFrom::Current(i64::try_from(num_bytes)?))
-                .await?;
-        } else {
-            out.write_all(&chunk).await?;
+                        let num_bytes = data.read(&mut buffer[..]).await?;
+                        if num_bytes == 0 {
+                            return Ok(());
+                        }
+
+                        if buffer[..num_bytes].iter().all(|b| *b == 0) {
+                            let results = future::join(
+                                task_tx.send(Task::Skip(num_bytes)),
+                                buffer_tx_ref.send(buffer),
+                            )
+                            .await;
+                            results.0?;
+                            results.1?;
+                        } else {
+                            task_tx.send(Task::Write(buffer, num_bytes)).await?;
+                        }
+
+                        *opt_task_tx = Some(task_tx);
+
+                        Ok(())
+                    }
+                }),
+        );
+
+        match future::try_select(read_buffer, run_tasks).await {
+            Ok(Either::Left(((), rest_tasks))) => {
+                run_tasks = rest_tasks;
+            }
+            Ok(Either::Right((mut out, _))) => {
+                out.flush().await?;
+                break;
+            }
+            Err(Either::Left((err, _))) | Err(Either::Right((err, _))) => return Err(err),
         }
     }
 
-    Ok(out.flush().await?)
+    Ok(())
 }
 
 struct ReadStream<S, B> {
@@ -236,6 +320,7 @@ async fn main() -> anyhow::Result<()> {
         allowed_paths,
         listen_on,
         buffer_size,
+        parallelism,
     } = Args::parse();
 
     let allowed_paths = allowed_paths
@@ -356,7 +441,7 @@ async fn main() -> anyhow::Result<()> {
                 };
 
                 if allowed_paths.is_match(&*path) {
-                    write_bytes_to(&*path, body, buffer_size)
+                    write_bytes_to(&*path, body, buffer_size, parallelism)
                         .await
                         .map_err(to_io_err)?;
                 }
