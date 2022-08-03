@@ -76,7 +76,7 @@ struct Args {
 
     /// Set the number of buffers to decode in parallel while writing to the output
     /// file.
-    #[clap(short = 'p', long = "parallel", default_value_t = 1)]
+    #[clap(short = 'p', long = "parallel", default_value_t = 16)]
     parallelism: usize,
 }
 
