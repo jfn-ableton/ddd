@@ -314,8 +314,7 @@ async fn byte_stream_to_string<B: AsRef<[u8]>, S: Stream<Item = io::Result<B>> +
     String::from_utf8(out).map_err(to_io_err)
 }
 
-#[actix_web::main]
-async fn main() -> anyhow::Result<()> {
+async fn async_main() -> anyhow::Result<()> {
     let Args {
         allowed_paths,
         listen_on,
@@ -453,4 +452,12 @@ async fn main() -> anyhow::Result<()> {
     .bind(&listen_on[..])?
     .run()
     .await?)
+}
+
+fn main() -> anyhow::Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async_main())
 }
