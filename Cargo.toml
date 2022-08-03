@@ -1,5 +1,7 @@
 [package]
 name = "ddd"
+description = "A small service to flash a HTTP passed image onto a disk"
+homepage = "https://github.com/jfn-ableton/ddd"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
