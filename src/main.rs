@@ -20,13 +20,16 @@ use std::{
 };
 use tokio::{
     fs,
-    io::{self, AsyncBufRead, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    io::{
+        self, AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt,
+    },
     sync::oneshot,
 };
 use wax::{BuildError, Glob, Pattern};
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 enum Compression {
-    None,
+    Uncompressed,
     Brotli,
     Bz,
     Deflate,
@@ -37,19 +40,26 @@ enum Compression {
     Zstd,
 }
 
+impl Default for Compression {
+    fn default() -> Self {
+        Self::Uncompressed
+    }
+}
+
 impl Compression {
-    fn from_str(s: &str) -> Option<Self> {
+    fn from_str(s: &str) -> anyhow::Result<Option<Self>> {
         match s {
-            "none" => Some(Self::None),
-            "brotli" => Some(Self::Brotli),
-            "bz" => Some(Self::Bz),
-            "deflate" => Some(Self::Deflate),
-            "gzip" => Some(Self::Gzip),
-            "lzma" => Some(Self::Lzma),
-            "xz" => Some(Self::Xz),
-            "zlib" => Some(Self::Zlib),
-            "zstd" => Some(Self::Zstd),
-            _ => None,
+            "infer" => Ok(None),
+            "none" => Ok(Some(Self::Uncompressed)),
+            "brotli" => Ok(Some(Self::Brotli)),
+            "bz" | "bz2" | "bzip2" => Ok(Some(Self::Bz)),
+            "deflate" => Ok(Some(Self::Deflate)),
+            "gzip" | "gz" => Ok(Some(Self::Gzip)),
+            "lzma" => Ok(Some(Self::Lzma)),
+            "xz" => Ok(Some(Self::Xz)),
+            "zlib" => Ok(Some(Self::Zlib)),
+            "zstd" | "zst" => Ok(Some(Self::Zstd)),
+            _ => Err(anyhow::format_err!("Unknown compression type {}", s)),
         }
     }
 }
@@ -374,11 +384,7 @@ async fn async_main() -> anyhow::Result<()> {
                                             ))?
                                             .send(
                                                 byte_stream_to_string(field.map_err(to_io_err))
-                                                    .and_then(|value| async move {
-                                                        Compression::from_str(&*value).ok_or_else(
-                                                            mk_io_err("Unknown compression type"),
-                                                        )
-                                                    }),
+                                                    .map_ok(|value| Compression::from_str(&*value)),
                                             );
                                     }
                                     "body" => {
@@ -386,6 +392,8 @@ async fn async_main() -> anyhow::Result<()> {
                                             .take()
                                             .ok_or_else(mk_io_err("Multiple bodies specified"))?
                                             .send(field);
+                                        let _ = compression_field_tx.take();
+                                        let _ = path_field_tx.take();
                                     }
                                     // TODO: Should we ignore or fail on unknown fields?
                                     _ => {}
@@ -418,32 +426,109 @@ async fn async_main() -> anyhow::Result<()> {
                             .try_flatten(),
                     ) => {
                         let (path, body) = path_body?;
+                        let compression =
+                            compression.unwrap_or(Ok(None))
+                                .map_err(to_io_err)?;
 
                         (path, body, compression)
                     },
                 );
-                let compression = compression.unwrap_or(Compression::None);
+
+                if !allowed_paths.is_match(&*path) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        anyhow::format_err!("Path {} does not match allowed paths", path.display()),
+                    ));
+                }
 
                 let mut body = body.map_err(to_io_err);
-                let body_reader = ReadStream::new(Pin::new(&mut body));
+                let mut body_reader = ReadStream::new(Pin::new(&mut body));
 
-                let body: Pin<Box<dyn AsyncRead>> = match compression {
-                    Compression::None => Box::pin(body_reader),
-                    Compression::Brotli => Box::pin(BrotliDecoder::new(body_reader)),
-                    Compression::Bz => Box::pin(BzDecoder::new(body_reader)),
-                    Compression::Deflate => Box::pin(DeflateDecoder::new(body_reader)),
-                    Compression::Gzip => Box::pin(GzipDecoder::new(body_reader)),
-                    Compression::Lzma => Box::pin(LzmaDecoder::new(body_reader)),
-                    Compression::Xz => Box::pin(XzDecoder::new(body_reader)),
-                    Compression::Zlib => Box::pin(ZlibDecoder::new(body_reader)),
-                    Compression::Zstd => Box::pin(ZstdDecoder::new(body_reader)),
+                let inferred_compression = {
+                    let buf = body_reader.fill_buf().await?;
+                    infer::get(buf)
+                        .and_then(|kind| Compression::from_str(kind.extension()).ok().flatten())
                 };
+                let compression = compression.or(inferred_compression).unwrap_or_default();
 
-                if allowed_paths.is_match(&*path) {
-                    write_bytes_to(&*path, body, buffer_size, parallelism)
+                match compression {
+                    Compression::Uncompressed => {
+                        write_bytes_to(&*path, body_reader, buffer_size, parallelism).await
+                    }
+                    Compression::Brotli => {
+                        write_bytes_to(
+                            &*path,
+                            BrotliDecoder::new(body_reader),
+                            buffer_size,
+                            parallelism,
+                        )
                         .await
-                        .map_err(to_io_err)?;
+                    }
+                    Compression::Bz => {
+                        write_bytes_to(
+                            &*path,
+                            BzDecoder::new(body_reader),
+                            buffer_size,
+                            parallelism,
+                        )
+                        .await
+                    }
+                    Compression::Deflate => {
+                        write_bytes_to(
+                            &*path,
+                            DeflateDecoder::new(body_reader),
+                            buffer_size,
+                            parallelism,
+                        )
+                        .await
+                    }
+                    Compression::Gzip => {
+                        write_bytes_to(
+                            &*path,
+                            GzipDecoder::new(body_reader),
+                            buffer_size,
+                            parallelism,
+                        )
+                        .await
+                    }
+                    Compression::Lzma => {
+                        write_bytes_to(
+                            &*path,
+                            LzmaDecoder::new(body_reader),
+                            buffer_size,
+                            parallelism,
+                        )
+                        .await
+                    }
+                    Compression::Xz => {
+                        write_bytes_to(
+                            &*path,
+                            XzDecoder::new(body_reader),
+                            buffer_size,
+                            parallelism,
+                        )
+                        .await
+                    }
+                    Compression::Zlib => {
+                        write_bytes_to(
+                            &*path,
+                            ZlibDecoder::new(body_reader),
+                            buffer_size,
+                            parallelism,
+                        )
+                        .await
+                    }
+                    Compression::Zstd => {
+                        write_bytes_to(
+                            &*path,
+                            ZstdDecoder::new(body_reader),
+                            buffer_size,
+                            parallelism,
+                        )
+                        .await
+                    }
                 }
+                .map_err(to_io_err)?;
 
                 Ok::<_, io::Error>(format!("Done!"))
             }),
